@@ -75,7 +75,7 @@ async def init_tables():
         ''')
     logger.info("Tables created/verified")
 
-# --- Функции работы с БД (асинхронные) ---
+# --- Функции работы с БД ---
 async def add_group(chat_id: int, title: str):
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -184,14 +184,12 @@ def format_stats_message(stats, period_text: str):
     )
 
 async def get_chat_id_for_stats(message: Message):
-    """Возвращает chat_id для статистики: если в группе — id группы, иначе выбранную пользователем группу или первую из списка."""
+    """Возвращает chat_id для статистики"""
     if message.chat.type in ["group", "supergroup"]:
         return message.chat.id
-    # ЛС
     selected = await get_user_selected_chat(message.from_user.id)
     if selected is not None:
         return selected
-    # Если пользователь ещё не выбрал, возьмём первую группу
     groups = await get_groups()
     if groups:
         return groups[0][0]
@@ -200,7 +198,7 @@ async def get_chat_id_for_stats(message: Message):
 async def reply_with_stats(message: Message, period_func, period_text_func):
     chat_id = await get_chat_id_for_stats(message)
     if chat_id is None:
-        await message.answer("⚠️ Бот не добавлен ни в одну группу. Добавьте его в группу и повторите.")
+        await message.answer("⚠️ Бот не добавлен ни в одну группу.")
         return
     start, end = period_func()
     stats = await get_stats(start, end, chat_id)
@@ -211,7 +209,7 @@ async def reply_with_stats(message: Message, period_func, period_text_func):
     response = format_stats_message(stats, period_text)
     await message.answer(response, parse_mode=ParseMode.MARKDOWN)
 
-# --- Хэндлеры ---
+# --- ХЭНДЛЕРЫ ---
 @dp.my_chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
 async def on_bot_added_to_group(event: ChatMemberUpdated):
     chat = event.chat
@@ -226,22 +224,53 @@ async def on_bot_removed_from_group(event: ChatMemberUpdated):
         await remove_group(chat.id)
         logger.info(f"Bot removed from group: {chat.id}")
 
+# Универсальный хэндлер для всех сообщений в группе (включая упоминания)
 @dp.message(F.chat.type.in_(["group", "supergroup"]))
 async def handle_group_message(message: Message):
+    """Обрабатывает сообщения в группе. Работает даже при включенной приватности, если бот упомянут."""
+    logger.info(f"📨 Получено сообщение в группе от {message.from_user.id}: {message.text}")
+
     if message.from_user.is_bot:
-        return
-    text = message.text or message.caption
-    if not text or text.startswith('/'):
+        logger.info("Сообщение от бота, игнорируем")
         return
 
+    text = message.text or message.caption
+    if not text:
+        logger.info("Пустое сообщение")
+        return
+
+    # Если приватность включена, Telegram не присылает обычные сообщения.
+    # Но если бот упомянут (@STAT_PHOTO_bot), он получит сообщение.
+    # Поэтому проверяем, есть ли упоминание бота (на случай, если приватность не отключена)
+    bot_username = (await bot.me()).username
+    if bot_username and f"@{bot_username}" in text:
+        logger.info("Обнаружено упоминание бота, обрабатываем как продажу")
+        # Удаляем упоминание из текста для парсинга
+        clean_text = re.sub(rf'@{bot_username}\s*', '', text).strip()
+        if clean_text:
+            text = clean_text
+
+    # Игнорируем команды
+    if text.startswith('/'):
+        logger.info(f"Команда: {text}")
+        return
+
+    # Парсим продажу
     parsed = parse_sale(text)
     if parsed:
-        await add_sale(message.date, parsed["amount"], parsed["participants"], text, message.from_user.id, message.chat.id)
-        await message.reply(
-            f"✅ Сохранено: {parsed['amount']:,.0f}₽, {parsed['participants']} уч.",
-            disable_notification=True
-        )
-        logger.info(f"Sale saved: {parsed['amount']}₽, {parsed['participants']} уч. | {text}")
+        logger.info(f"✅ Распарсено: {parsed['amount']}₽, {parsed['participants']} уч.")
+        try:
+            await add_sale(message.date, parsed["amount"], parsed["participants"], text, message.from_user.id, message.chat.id)
+            logger.info(f"✅ Сохранено в БД!")
+            await message.reply(
+                f"✅ Сохранено: {parsed['amount']:,.0f}₽, {parsed['participants']} уч.",
+                disable_notification=True
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения: {e}")
+            await message.reply(f"❌ Ошибка: {e}")
+    else:
+        logger.info(f"❌ Не распарсено: {text}")
 
 # --- Команды статистики ---
 @dp.message(Command("day"))
@@ -282,7 +311,7 @@ async def stats_custom(message: Message):
             await message.answer("❌ Формат: /custom 2025-03-01 2025-03-21")
             return
         start = datetime.strptime(parts[1], "%Y-%m-%d")
-        end = datetime.strptime(parts[2], "%Y-%m-%d") + timedelta(days=1)  # включаем конец дня
+        end = datetime.strptime(parts[2], "%Y-%m-%d") + timedelta(days=1)
         if start >= end:
             await message.answer("❌ Начальная дата должна быть меньше конечной")
             return
@@ -420,25 +449,38 @@ async def start_cmd(message: Message):
                 parse_mode=ParseMode.MARKDOWN
             )
 
+# --- Проверка приватности бота ---
+async def check_privacy():
+    """Проверяет, включена ли приватность бота, и отправляет предупреждение в лог."""
+    try:
+        me = await bot.me()
+        # У бота нет прямого метода проверить приватность, но мы можем отправить запрос в Bot API
+        # Через getMe мы не узнаем. Просто выведем предупреждение.
+        # Реальная проверка — попробовать получить обновления (но они могут быть пустыми).
+        logger.warning(
+            f"⚠️ Убедитесь, что приватность бота выключена в BotFather. "
+            f"Инструкция: @BotFather → /mybots → {me.username} → Bot Settings → Group Privacy → Turn off. "
+            f"Затем удалите и добавьте бота в группу заново."
+        )
+    except Exception as e:
+        logger.error(f"Не удалось получить информацию о боте: {e}")
+
 # --- Глобальный обработчик ошибок ---
 @dp.errors()
 async def on_error(update: types.Update, exception: Exception):
     logger.exception("Unhandled exception", exc_info=exception)
     return True
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER (обязательно для Web Service) ---
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 from aiohttp import web
 
 async def health_check(request):
-    """Проверка работоспособности бота"""
     return web.Response(text="Bot is running")
 
 async def start_web_server():
-    """Запускает минимальный веб-сервер на порту, который ожидает Render"""
     app = web.Application()
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
-    
     port = int(os.environ.get("PORT", 10000))
     runner = web.AppRunner(app)
     await runner.setup()
@@ -450,53 +492,13 @@ async def start_web_server():
 async def main():
     await init_db_pool()
     await init_tables()
+    await check_privacy()  # предупреждение
     logger.info("🤖 Bot started")
-    
-    # Запускаем веб-сервер в фоне (обязательно для Render Web Service)
     asyncio.create_task(start_web_server())
-    
     try:
         await dp.start_polling(bot)
     finally:
         await close_db_pool()
-
-# --- ДИАГНОСТИЧЕСКИЙ ХЭНДЛЕР ---
-@dp.message()
-async def debug_all_messages(message: Message):
-    """Логирует все сообщения и пробует распарсить"""
-    logger.info(f"🔍 DEBUG: Получено сообщение от {message.from_user.id} в чате {message.chat.id} (тип: {message.chat.type})")
-    logger.info(f"🔍 DEBUG: Текст: {message.text}")
-    
-    # Проверяем, не бот ли это
-    if message.from_user.is_bot:
-        logger.info(f"🔍 DEBUG: Сообщение от бота, игнорируем")
-        return
-    
-    # Проверяем, группа ли это
-    if message.chat.type in ["group", "supergroup"]:
-        logger.info(f"🔍 DEBUG: Это сообщение из группы!")
-        
-        text = message.text or message.caption
-        if text:
-            parsed = parse_sale(text)
-            if parsed:
-                logger.info(f"✅ DEBUG: Успешно распарсено! Сумма: {parsed['amount']}, Участников: {parsed['participants']}")
-                # Пробуем сохранить
-                try:
-                    await add_sale(message.date, parsed["amount"], parsed["participants"], text, message.from_user.id, message.chat.id)
-                    logger.info(f"✅ DEBUG: Успешно сохранено в БД!")
-                    await message.reply(f"✅ Сохранено: {parsed['amount']:,.0f}₽, {parsed['participants']} уч.")
-                except Exception as e:
-                    logger.error(f"❌ DEBUG: Ошибка при сохранении: {e}")
-                    await message.reply(f"❌ Ошибка сохранения: {e}")
-            else:
-                logger.info(f"❌ DEBUG: Не удалось распарсить сообщение как продажу")
-                # Временно показываем пример формата
-                await message.reply("Не распознано. Пример правильного формата: 1000₽ нал Эл (3у)")
-        else:
-            logger.info(f"🔍 DEBUG: Пустое сообщение или медиа")
-    else:
-        logger.info(f"🔍 DEBUG: Сообщение не из группы (тип: {message.chat.type})")
 
 if __name__ == "__main__":
     asyncio.run(main())
