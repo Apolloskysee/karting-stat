@@ -46,11 +46,11 @@ async def close_db_pool():
 
 async def init_tables():
     async with db_pool.acquire() as conn:
-        # Таблица продаж
+        # Таблица продаж (явно TIMESTAMP WITHOUT TIME ZONE)
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS sales (
                 id SERIAL PRIMARY KEY,
-                date TIMESTAMP NOT NULL,
+                date TIMESTAMP WITHOUT TIME ZONE NOT NULL,
                 amount NUMERIC(10,2) NOT NULL,
                 participants INTEGER NOT NULL,
                 raw_text TEXT,
@@ -63,17 +63,35 @@ async def init_tables():
             CREATE TABLE IF NOT EXISTS groups (
                 chat_id BIGINT PRIMARY KEY,
                 title TEXT NOT NULL,
-                added_at TIMESTAMP DEFAULT NOW()
+                added_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
             )
         ''')
-        # Таблица настроек пользователей (выбранная группа)
+        # Таблица настроек пользователей
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id BIGINT PRIMARY KEY,
                 selected_chat_id BIGINT
             )
         ''')
+
+        # Проверяем, что колонка date имеет правильный тип (на случай старой БД)
+        col_info = await conn.fetchrow("""
+            SELECT data_type 
+            FROM information_schema.columns 
+            WHERE table_name = 'sales' AND column_name = 'date'
+        """)
+        if col_info and col_info['data_type'] != 'timestamp without time zone':
+            await conn.execute("ALTER TABLE sales ALTER COLUMN date TYPE TIMESTAMP WITHOUT TIME ZONE")
+            logger.info("Altered date column to TIMESTAMP WITHOUT TIME ZONE")
+
     logger.info("Tables created/verified")
+
+# --- Утилита для приведения даты к naive (без часового пояса) ---
+def ensure_naive(dt: datetime) -> datetime:
+    """Убирает часовой пояс, если он есть, возвращает naive datetime."""
+    if dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
 
 # --- Функции работы с БД ---
 async def add_group(chat_id: int, title: str):
@@ -105,6 +123,8 @@ async def set_user_selected_chat(user_id: int, chat_id: int):
         )
 
 async def add_sale(date: datetime, amount: float, participants: int, raw_text: str, user_id: int, chat_id: int):
+    """Сохраняет продажу. date должна быть naive."""
+    date = ensure_naive(date)
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO sales (date, amount, participants, raw_text, user_id, chat_id) VALUES ($1, $2, $3, $4, $5, $6)",
@@ -112,6 +132,9 @@ async def add_sale(date: datetime, amount: float, participants: int, raw_text: s
         )
 
 async def get_stats(start_date: datetime, end_date: datetime, chat_id: int = None):
+    """Возвращает статистику за период. start_date и end_date должны быть naive."""
+    start_date = ensure_naive(start_date)
+    end_date = ensure_naive(end_date)
     async with db_pool.acquire() as conn:
         if chat_id is not None:
             rows = await conn.fetch(
@@ -224,7 +247,7 @@ async def on_bot_removed_from_group(event: ChatMemberUpdated):
         await remove_group(chat.id)
         logger.info(f"Bot removed from group: {chat.id}")
 
-# Универсальный хэндлер для всех сообщений в группе (включая упоминания)
+# Универсальный хэндлер для всех сообщений в группе
 @dp.message(F.chat.type.in_(["group", "supergroup"]))
 async def handle_group_message(message: Message):
     """Обрабатывает сообщения в группе. Работает даже при включенной приватности, если бот упомянут."""
@@ -241,11 +264,9 @@ async def handle_group_message(message: Message):
 
     # Если приватность включена, Telegram не присылает обычные сообщения.
     # Но если бот упомянут (@STAT_PHOTO_bot), он получит сообщение.
-    # Поэтому проверяем, есть ли упоминание бота (на случай, если приватность не отключена)
     bot_username = (await bot.me()).username
     if bot_username and f"@{bot_username}" in text:
         logger.info("Обнаружено упоминание бота, обрабатываем как продажу")
-        # Удаляем упоминание из текста для парсинга
         clean_text = re.sub(rf'@{bot_username}\s*', '', text).strip()
         if clean_text:
             text = clean_text
@@ -451,19 +472,13 @@ async def start_cmd(message: Message):
 
 # --- Проверка приватности бота ---
 async def check_privacy():
-    """Проверяет, включена ли приватность бота, и отправляет предупреждение в лог."""
-    try:
-        me = await bot.me()
-        # У бота нет прямого метода проверить приватность, но мы можем отправить запрос в Bot API
-        # Через getMe мы не узнаем. Просто выведем предупреждение.
-        # Реальная проверка — попробовать получить обновления (но они могут быть пустыми).
-        logger.warning(
-            f"⚠️ Убедитесь, что приватность бота выключена в BotFather. "
-            f"Инструкция: @BotFather → /mybots → {me.username} → Bot Settings → Group Privacy → Turn off. "
-            f"Затем удалите и добавьте бота в группу заново."
-        )
-    except Exception as e:
-        logger.error(f"Не удалось получить информацию о боте: {e}")
+    """Выводит предупреждение о необходимости отключить приватность."""
+    me = await bot.me()
+    logger.warning(
+        f"⚠️ Убедитесь, что приватность бота выключена в BotFather. "
+        f"Инструкция: @BotFather → /mybots → {me.username} → Bot Settings → Group Privacy → Turn off. "
+        f"Затем удалите и добавьте бота в группу заново."
+    )
 
 # --- Глобальный обработчик ошибок ---
 @dp.errors()
@@ -492,7 +507,7 @@ async def start_web_server():
 async def main():
     await init_db_pool()
     await init_tables()
-    await check_privacy()  # предупреждение
+    await check_privacy()
     logger.info("🤖 Bot started")
     asyncio.create_task(start_web_server())
     try:
