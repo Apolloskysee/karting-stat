@@ -460,5 +460,43 @@ async def main():
     finally:
         await close_db_pool()
 
+# --- ДИАГНОСТИЧЕСКИЙ ХЭНДЛЕР ---
+@dp.message()
+async def debug_all_messages(message: Message):
+    """Логирует все сообщения и пробует распарсить"""
+    logger.info(f"🔍 DEBUG: Получено сообщение от {message.from_user.id} в чате {message.chat.id} (тип: {message.chat.type})")
+    logger.info(f"🔍 DEBUG: Текст: {message.text}")
+    
+    # Проверяем, не бот ли это
+    if message.from_user.is_bot:
+        logger.info(f"🔍 DEBUG: Сообщение от бота, игнорируем")
+        return
+    
+    # Проверяем, группа ли это
+    if message.chat.type in ["group", "supergroup"]:
+        logger.info(f"🔍 DEBUG: Это сообщение из группы!")
+        
+        text = message.text or message.caption
+        if text:
+            parsed = parse_sale(text)
+            if parsed:
+                logger.info(f"✅ DEBUG: Успешно распарсено! Сумма: {parsed['amount']}, Участников: {parsed['participants']}")
+                # Пробуем сохранить
+                try:
+                    await add_sale(message.date, parsed["amount"], parsed["participants"], text, message.from_user.id, message.chat.id)
+                    logger.info(f"✅ DEBUG: Успешно сохранено в БД!")
+                    await message.reply(f"✅ Сохранено: {parsed['amount']:,.0f}₽, {parsed['participants']} уч.")
+                except Exception as e:
+                    logger.error(f"❌ DEBUG: Ошибка при сохранении: {e}")
+                    await message.reply(f"❌ Ошибка сохранения: {e}")
+            else:
+                logger.info(f"❌ DEBUG: Не удалось распарсить сообщение как продажу")
+                # Временно показываем пример формата
+                await message.reply("Не распознано. Пример правильного формата: 1000₽ нал Эл (3у)")
+        else:
+            logger.info(f"🔍 DEBUG: Пустое сообщение или медиа")
+    else:
+        logger.info(f"🔍 DEBUG: Сообщение не из группы (тип: {message.chat.type})")
+
 if __name__ == "__main__":
     asyncio.run(main())
