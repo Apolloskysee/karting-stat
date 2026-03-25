@@ -426,11 +426,35 @@ async def on_error(update: types.Update, exception: Exception):
     logger.exception("Unhandled exception", exc_info=exception)
     return True
 
-# --- Запуск ---
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER (обязательно для Web Service) ---
+from aiohttp import web
+
+async def health_check(request):
+    """Проверка работоспособности бота"""
+    return web.Response(text="Bot is running")
+
+async def start_web_server():
+    """Запускает минимальный веб-сервер на порту, который ожидает Render"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"🌐 Web server started on port {port}")
+
+# --- ЗАПУСК ---
 async def main():
     await init_db_pool()
     await init_tables()
-    logger.info("Bot started")
+    logger.info("🤖 Bot started")
+    
+    # Запускаем веб-сервер в фоне (обязательно для Render Web Service)
+    asyncio.create_task(start_web_server())
+    
     try:
         await dp.start_polling(bot)
     finally:
